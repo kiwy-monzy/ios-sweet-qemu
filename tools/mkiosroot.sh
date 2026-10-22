@@ -21,6 +21,11 @@ set -euo pipefail
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
+# Every input must be the DMG file itself: passing a directory to apfs-fuse
+# fails much later with a misleading "invalid superblock".
+for f in "$os" "$sysos" "$appos"; do
+	[[ -f $f ]] || { echo "not a regular file: $f" >&2; exit 1; }
+done
 
 # Pre-flight tool check
 missing_tools=()

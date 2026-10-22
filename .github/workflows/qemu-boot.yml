@@ -191,21 +191,36 @@ jobs:
           fi
           echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
           python3 tools/remotezip.py "$IPSW_URL" BuildManifest.plist ipsw/
+          # 16.7.x manifests keep the image paths in Manifest (older ones in
+          # Images) and name the cryptexes Cryptex1,SystemOS / Cryptex1,AppOS.
           python3 - <<'EOF' >> "$GITHUB_ENV"
           import plistlib
           m = plistlib.load(open('ipsw/BuildManifest.plist', 'rb'))
           for ident in m['BuildIdentities']:
-              imgs = ident.get('Images', {})
-              if all(k in imgs for k in ('OS', 'SystemOS', 'AppOS')):
-                  for k in ('OS', 'SystemOS', 'AppOS'):
-                      print(f"DMG_{k}={imgs[k]['Info']['Path']}")
+              man = dict(ident.get('Manifest') or {})
+              man.update(ident.get('Images') or {})
+              def pick(*keys):
+                  for k in keys:
+                      p = ((man.get(k) or {}).get('Info') or {}).get('Path') or ''
+                      if p.endswith('.dmg'):
+                          return p
+                  return ''
+              os_, sysos, appos = pick('OS'), pick('SystemOS', 'Cryptex1,SystemOS'), pick('AppOS', 'Cryptex1,AppOS')
+              if os_ and sysos:
+                  print(f"DMG_OS={os_}")
+                  print(f"DMG_SystemOS={sysos}")
+                  print(f"DMG_AppOS={appos}")
                   break
           EOF
+          [ -n "$DMG_OS" ] && [ -n "$DMG_SystemOS" ] || {
+            echo "::error::BuildManifest has no OS/SystemOS image paths"; exit 1; }
           for k in OS SystemOS AppOS; do
             eval "name=\$DMG_$k"
+            # AppOS is tiny (10 MB) on 16.7.x; skip if the manifest has none.
+            [ -n "$name" ] || { echo "no DMG_$k in this manifest"; continue; }
             python3 tools/remotezip.py "$IPSW_URL" "$name" ipsw/
           done
-          ls -la ipsw/
+          ls -la ipsw/*.dmg
 
       - name: Build the iOS root image (mkiosroot, ${{ inputs.full_root_size || '6G' }})
         run: |
