@@ -25,6 +25,9 @@ on:
       full_root_size:
         description: "HFS+ root image size for the full-root job"
         default: "6G"
+      upload_root_image:
+        description: "Upload the built HFS+ root image as an artifact (~3 GB) so it can be booted locally"
+        default: "false"
   workflow_run:
     workflows: [xnu]
     types: [completed]
@@ -169,7 +172,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           sudo apt-get update -q
           sudo apt-get install -y -q qemu-system-arm llvm hfsprogs rsync \
-            cmake libfuse3-dev libicu-dev bzip2 git jq \
+            cmake libfuse3-dev libicu-dev bzip2 git jq zstd \
             libbz2-dev zlib1g-dev pkg-config
           df -h /
 
@@ -292,3 +295,19 @@ jobs:
           path: |
             out/
           retention-days: 14
+
+      - name: Pack the real root image (optional)
+        if: always() && inputs.upload_root_image == 'true'
+        run: |
+          [ -f /tmp/ios16-root.img ] || { echo "no root image in this run"; exit 0; }
+          zstd -q -3 -T0 -o /tmp/ios16-root.img.zst /tmp/ios16-root.img
+          ls -l /tmp/ios16-root.img /tmp/ios16-root.img.zst
+
+      - name: Upload the real root image (optional)
+        if: always() && inputs.upload_root_image == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-root-hfs
+          path: /tmp/ios16-root.img.zst
+          if-no-files-found: ignore
+          retention-days: 7
