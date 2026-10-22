@@ -1,0 +1,245 @@
+name: qemu-boot
+
+# Real QEMU boot tests of the SWEET kernel built by xnu.yml:
+#   1. qemu-userspace — the proven path: kernel + QEMU ADT + sweet-init userspace
+#      ramdisk, rd=md0 -> BSD root md0 -> /sbin/launchd -> "init running as PID 1".
+#      This job must pass (it fails the run otherwise).
+#   2. qemu-full-root — best-effort: real iPhone X 16.7.16 root filesystem from
+#      Apple's IPSW (tools/mkiosroot.sh) as the md0 RAM disk, booting toward the
+#      real launchd/SpringBoard. Experimental (guest RAM must be stretched beyond
+#      the phone's 3.95 GiB to hold the image); it never blocks the run.
+#
+# Kernel source: the `xnu-kernel` artifact of an xnu.yml run in this repo.
+# Chain automatically after every successful xnu run, or dispatch by hand
+# (leave kernel_run_id empty to use the latest successful xnu run).
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: "xnu.yml run ID whose xnu-kernel artifact to boot (empty = latest successful)"
+        default: ""
+      ipsw_url:
+        description: "IPSW URL for the full-root job (empty = look up iPhone10,3 16.7.16)"
+        default: ""
+      full_root_size:
+        description: "HFS+ root image size for the full-root job"
+        default: "6G"
+  workflow_run:
+    workflows: [xnu]
+    types: [completed]
+
+concurrency:
+  group: qemu-boot-${{ github.event.workflow_run.id || github.event.inputs.kernel_run_id || 'manual' }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  qemu-userspace:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve xnu run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID="${{ inputs.kernel_run_id || github.event.workflow_run.id || '' }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml -s success -L 1 --json databaseId -q '.[0].databaseId')
+          fi
+          [ -n "$RUN_ID" ] || { echo "::error::no xnu.yml run found - run the xnu workflow first"; exit 1; }
+          echo "KERNEL_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "booting kernel from xnu run $RUN_ID"
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          run-id: ${{ env.KERNEL_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: xnu-out
+
+      - name: Install QEMU + LLVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-arm llvm
+          python3 tools/qemu-sweet.py --check-env || true
+
+      - name: Build userspace init + payload
+        run: |
+          K=$(find xnu-out -name 'kernel.development.sweet' | head -1)
+          [ -n "$K" ] || K=$(find xnu-out -name 'kernel.*' ! -name '*unstripped*' ! -name '*.txt' | head -1)
+          echo "KERNEL=$K" | tee -a "$GITHUB_ENV"
+          # PID 1 demo userspace (static arm64 Mach-O, ad-hoc signed)
+          cpp -x assembler-with-cpp -P tools/sweet-init.S > /tmp/sweet-init.s
+          llvm-mc -arch=arm64 -filetype=obj -triple=arm64-apple-ios16.0.0 /tmp/sweet-init.s -o /tmp/sweet-init.o
+          python3 tools/mkinit.py /tmp/sweet-init.o /tmp/init
+          python3 tools/mkadt.py /tmp/qemu.adt --qemu
+          python3 tools/mkpayload.py "$K" /tmp/qemu.adt /tmp/payload.bin \
+            --ramdisk /tmp/init --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0'
+
+      - name: Boot (120 s, TCG)
+        run: |
+          KFLAGS=""
+          if llvm-nm --defined-only "$KERNEL" | awk '{print $3}' | grep -qx '_iso_font'; then
+            KFLAGS="--kernel $KERNEL"
+          fi
+          python3 tools/qemu-sweet.py /tmp/payload.bin out --secs 120 $KFLAGS --live-serial
+
+      - name: Verdict (PID 1 or bust)
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          s = open('out/serial.txt', errors='replace').read()
+          v = {
+              'bsd_root_md0': 'BSD root: md0' in s,
+              'pid1': 'init running as PID' in s,
+              'heartbeats': s.count('still alive'),
+              'panic': 'panic(cpu ' in s or 'SWEET EARLY PANIC:' in s,
+          }
+          v['pass'] = v['pid1'] and not v['panic']
+          open('out/boot-verdict.json', 'w').write(json.dumps(v, indent=2) + '\n')
+          print(json.dumps(v, indent=2))
+          sys.exit(0 if v['pass'] else 1)
+          EOF
+
+      - name: Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-userspace-results
+          path: |
+            out/
+          retention-days: 14
+
+  qemu-full-root:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    continue-on-error: true       # experimental: stretched guest RAM, real IPSW
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve xnu run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID="${{ inputs.kernel_run_id || github.event.workflow_run.id || '' }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml -s success -L 1 --json databaseId -q '.[0].databaseId')
+          fi
+          [ -n "$RUN_ID" ] || { echo "::error::no xnu.yml run found - run the xnu workflow first"; exit 1; }
+          echo "KERNEL_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          run-id: ${{ env.KERNEL_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: xnu-out
+
+      - name: Free disk + install deps
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-arm llvm hfsprogs rsync \
+            cmake libfuse3-dev libicu-dev bzip2 git jq
+          df -h /
+
+      - name: Build apfs-fuse (reads Apple's raw-APFS DMGs)
+        run: |
+          git clone -q --recursive https://github.com/sgan81/apfs-fuse /tmp/apfs-fuse
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/apfs-fuse/build -j"$(nproc)"
+          sudo cmake --install /tmp/apfs-fuse/build
+          apfs-fuse -v 2>&1 | head -2 || true
+
+      - name: Fetch iPhone X 16.7.16 IPSW pieces (HTTP range requests)
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          if [ -z "$IPSW_URL" ]; then
+            IPSW_URL=$(curl -sfL 'https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw' \
+              | jq -r '.firmwares[] | select(.version=="16.7.16") | .url')
+          fi
+          echo "IPSW_URL=$IPSW_URL" | tee -a "$GITHUB_ENV"
+          python3 tools/remotezip.py "$IPSW_URL" BuildManifest.plist ipsw/
+          python3 - <<'EOF' >> "$GITHUB_ENV"
+          import plistlib
+          m = plistlib.load(open('ipsw/BuildManifest.plist', 'rb'))
+          for ident in m['BuildIdentities']:
+              imgs = ident.get('Images', {})
+              if all(k in imgs for k in ('OS', 'SystemOS', 'AppOS')):
+                  for k in ('OS', 'SystemOS', 'AppOS'):
+                      print(f"DMG_{k}={imgs[k]['Info']['Path']}")
+                  break
+          EOF
+          for k in OS SystemOS AppOS; do
+            eval "name=\$DMG_$k"
+            python3 tools/remotezip.py "$IPSW_URL" "$name" ipsw/
+          done
+          ls -la ipsw/
+
+      - name: Build the iOS root image (mkiosroot, ${{ inputs.full_root_size || '6G' }})
+        run: |
+          tools/mkiosroot.sh "ipsw/$DMG_OS" "ipsw/$DMG_SystemOS" "ipsw/$DMG_AppOS" \
+            /tmp/ios16-root.img "${{ inputs.full_root_size || '6G' }}"
+          rm -f "ipsw/$DMG_OS" "ipsw/$DMG_SystemOS" "ipsw/$DMG_AppOS"   # free ~7 GB
+          df -h /
+
+      - name: Payload with the real root as md0
+        run: |
+          K=$(find xnu-out -name 'kernel.development.sweet' | head -1)
+          [ -n "$K" ] || K=$(find xnu-out -name 'kernel.*' ! -name '*unstripped*' ! -name '*.txt' | head -1)
+          echo "KERNEL=$K" | tee -a "$GITHUB_ENV"
+          # stretch guest RAM so the root image fits as a RAM disk (phone ADT caps at 3.95 GiB)
+          sed -i 's/HIGH_MEM_SIZE = 0xfcc00000/HIGH_MEM_SIZE = 0x1fcc00000/' tools/mkadt.py
+          python3 tools/mkadt.py /tmp/qemu.adt --qemu --highmem
+          python3 tools/mkpayload.py "$K" /tmp/qemu.adt /tmp/payload.bin \
+            --ramdisk /tmp/ios16-root.img --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0'
+          free -g
+
+      - name: Boot toward the real launchd (900 s, TCG)
+        run: |
+          KFLAGS=""
+          if llvm-nm --defined-only "$KERNEL" | awk '{print $3}' | grep -qx '_iso_font'; then
+            KFLAGS="--kernel $KERNEL"
+          fi
+          python3 tools/qemu-sweet.py /tmp/payload.bin out --secs 900 $KFLAGS --live-serial || true
+
+      - name: Verdict (informational)
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          s = open('out/serial.txt', errors='replace').read() if os.path.exists('out/serial.txt') else ''
+          v = {
+              'bsd_root_md0': 'BSD root: md0' in s,
+              'hfs_mounted': 'hfs' in s.lower(),
+              'launchd': '/sbin/launchd' in s or 'launchd' in s,
+              'springboard': 'SpringBoard' in s,
+              'panic': 'panic(cpu ' in s or 'SWEET EARLY PANIC:' in s,
+              'serial_bytes': len(s),
+          }
+          v['stage'] = ('springboard' if v['springboard'] else
+                        'launchd' if v['launchd'] else
+                        'md0' if v['bsd_root_md0'] else 'kernel')
+          open('out/full-root-verdict.json', 'w').write(json.dumps(v, indent=2) + '\n')
+          print(json.dumps(v, indent=2))
+          EOF
+
+      - name: Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-full-root-results
+          path: |
+            out/
+          retention-days: 14
