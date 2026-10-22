@@ -41,6 +41,12 @@ if [[ ${#missing_tools[@]} -gt 0 ]]; then
 	echo "    Fedora:        sudo dnf install apfs-fuse hfsplus-tools rsync" >&2
 	exit 1
 fi
+# mkfs/fsck alone are not enough: the image is populated through a loop mount.
+if ! grep -qw hfsplus /proc/filesystems; then
+	echo "Error: this kernel has no hfsplus driver (needed to fill the image)." >&2
+	echo "  Ubuntu/Debian: sudo apt install linux-modules-extra-\$(uname -r) && sudo modprobe hfsplus" >&2
+	exit 1
+fi
 
 work=$(mktemp -d)
 mounts=()

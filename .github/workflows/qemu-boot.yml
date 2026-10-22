@@ -174,6 +174,11 @@ jobs:
           sudo apt-get install -y -q qemu-system-arm llvm hfsprogs rsync \
             cmake libfuse3-dev libicu-dev bzip2 git jq zstd \
             libbz2-dev zlib1g-dev pkg-config
+          # The runner kernel ships the hfsplus driver in linux-modules-extra.
+          sudo modprobe hfsplus 2>/dev/null ||
+            sudo apt-get install -y -q linux-modules-extra-"$(uname -r)"
+          sudo modprobe hfsplus
+          grep -qw hfsplus /proc/filesystems
           df -h /
 
       - name: Build apfs-fuse (reads Apple's raw-APFS DMGs)
