@@ -95,16 +95,35 @@ jobs:
       - name: Verdict (PID 1 or bust)
         run: |
           python3 - <<'EOF'
-          import json, sys
-          s = open('out/serial.txt', errors='replace').read()
+          import json, os, re, sys
+
+          def read(path):
+              try:
+                  with open(path, errors='replace') as f:
+                      return f.read()
+              except OSError:
+                  return ''
+
+          # The SWEET kernel prints its console into the framebuffer, so the
+          # decoded framebuffer text (fb.txt) is the primary evidence; the
+          # serial file is the fallback for kernels that do write to the UART.
+          fb = read('out/fb.txt')
+          serial = read('out/serial.txt')
+          s = fb or serial
+          # the framebuffer wraps lines, so search a whitespace-flattened copy
+          flat = re.sub(r'\s+', ' ', s)
           v = {
-              'bsd_root_md0': 'BSD root: md0' in s,
-              'pid1': 'init running as PID' in s,
-              'heartbeats': s.count('still alive'),
-              'panic': 'panic(cpu ' in s or 'SWEET EARLY PANIC:' in s,
+              'source': 'fb.txt' if fb else ('serial.txt' if serial else 'none'),
+              'console_bytes': len(s),
+              'bsd_root_md0': 'BSD root: md0' in flat,
+              'pid1': 'init running as PID 1' in flat,
+              'heartbeats': flat.count('still alive'),
+              'panic': 'panic(cpu ' in flat or 'SWEET EARLY PANIC:' in flat,
           }
           v['pass'] = v['pid1'] and not v['panic']
-          open('out/boot-verdict.json', 'w').write(json.dumps(v, indent=2) + '\n')
+          os.makedirs('out', exist_ok=True)
+          with open('out/boot-verdict.json', 'w') as f:
+              f.write(json.dumps(v, indent=2) + '\n')
           print(json.dumps(v, indent=2))
           sys.exit(0 if v['pass'] else 1)
           EOF
@@ -150,7 +169,8 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           sudo apt-get update -q
           sudo apt-get install -y -q qemu-system-arm llvm hfsprogs rsync \
-            cmake libfuse3-dev libicu-dev bzip2 git jq
+            cmake libfuse3-dev libicu-dev bzip2 git jq \
+            libbz2-dev zlib1g-dev pkg-config
           df -h /
 
       - name: Build apfs-fuse (reads Apple's raw-APFS DMGs)
@@ -218,20 +238,34 @@ jobs:
         if: always()
         run: |
           python3 - <<'EOF'
-          import json, os
-          s = open('out/serial.txt', errors='replace').read() if os.path.exists('out/serial.txt') else ''
+          import json, os, re
+
+          def read(path):
+              try:
+                  with open(path, errors='replace') as f:
+                      return f.read()
+              except OSError:
+                  return ''
+
+          os.makedirs('out', exist_ok=True)
+          fb = read('out/fb.txt')
+          serial = read('out/serial.txt')
+          s = fb or serial
+          flat = re.sub(r'\s+', ' ', s)
           v = {
-              'bsd_root_md0': 'BSD root: md0' in s,
-              'hfs_mounted': 'hfs' in s.lower(),
-              'launchd': '/sbin/launchd' in s or 'launchd' in s,
-              'springboard': 'SpringBoard' in s,
-              'panic': 'panic(cpu ' in s or 'SWEET EARLY PANIC:' in s,
-              'serial_bytes': len(s),
+              'source': 'fb.txt' if fb else ('serial.txt' if serial else 'none'),
+              'bsd_root_md0': 'BSD root: md0' in flat,
+              'hfs_mounted': 'hfs' in flat.lower(),
+              'launchd': '/sbin/launchd' in flat,
+              'springboard': 'SpringBoard' in flat,
+              'panic': 'panic(cpu ' in flat or 'SWEET EARLY PANIC:' in flat,
+              'console_bytes': len(s),
           }
           v['stage'] = ('springboard' if v['springboard'] else
                         'launchd' if v['launchd'] else
                         'md0' if v['bsd_root_md0'] else 'kernel')
-          open('out/full-root-verdict.json', 'w').write(json.dumps(v, indent=2) + '\n')
+          with open('out/full-root-verdict.json', 'w') as f:
+              f.write(json.dumps(v, indent=2) + '\n')
           print(json.dumps(v, indent=2))
           EOF
 
