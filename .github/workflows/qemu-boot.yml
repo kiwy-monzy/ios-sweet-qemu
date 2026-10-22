@@ -196,7 +196,8 @@ jobs:
           python3 tools/remotezip.py "$IPSW_URL" BuildManifest.plist ipsw/
           # 16.7.x manifests keep the image paths in Manifest (older ones in
           # Images) and name the cryptexes Cryptex1,SystemOS / Cryptex1,AppOS.
-          python3 - <<'EOF' >> "$GITHUB_ENV"
+          # $GITHUB_ENV only reaches later steps, so source the same lines here.
+          python3 - <<'EOF' > /tmp/ipsw-env
           import plistlib
           m = plistlib.load(open('ipsw/BuildManifest.plist', 'rb'))
           for ident in m['BuildIdentities']:
@@ -215,6 +216,9 @@ jobs:
                   print(f"DMG_AppOS={appos}")
                   break
           EOF
+          cat /tmp/ipsw-env >> "$GITHUB_ENV"
+          set -a; . /tmp/ipsw-env; set +a
+          echo "images: OS=$DMG_OS SystemOS=$DMG_SystemOS AppOS=$DMG_AppOS"
           [ -n "$DMG_OS" ] && [ -n "$DMG_SystemOS" ] || {
             echo "::error::BuildManifest has no OS/SystemOS image paths"; exit 1; }
           for k in OS SystemOS AppOS; do
