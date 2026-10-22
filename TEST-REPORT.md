@@ -33,6 +33,55 @@ above were verified as follows:
    `tools/remotezip.py` — audited for Windows portability (pure Python +
    stdlib; no unix-only APIs on the QEMU/payload path).
 
+## Verified on a native Windows host (2026-10-22)
+
+The same boot was re-run on a real Windows 11 machine (i7-7700, 31.9 GiB RAM,
+QEMU 11.0.93 for Windows, LLVM 20.1.7, Python 3.13.15) — no WSL, no Linux:
+
+```
+clang -x assembler-with-cpp -E -P tools\sweet-init.S -o sweet-init.s
+clang -target arm64-apple-ios16.0.0 -c sweet-init.s -o sweet-init.o
+python tools\mkinit.py sweet-init.o init
+python tools\mkadt.py payload.adt --qemu
+python tools\mkpayload.py kernel.development.sweet payload.adt payload.bin \
+    --ramdisk init --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0"
+python tools\qemu-sweet.py payload.bin out --secs 150 --kernel kernel.development.sweet --live-serial
+```
+
+Result: the payload is byte-identical in layout to the CI build
+(`virt_base 0xfffffe0006000000`, `entry 0xfffffe000748b488`,
+`ramdisk 0xb24c8000`, `size 16621936`), and the boot reached
+`BSD root: md0` → `load_init_program: attempting to load /sbin/launchd` →
+`*** SWEET userspace: init running as PID 1 ***` with 23 heartbeats over
+150 s and no panic. `out/fb.png` holds the framebuffer screenshot of that
+run (the SWEET console is drawn into the panel, so the decoded console
+text is in `out/fb.txt`).
+
+Note: `out/serial.txt` stays **empty** in this configuration — the SWEET
+kernel prints its console into the framebuffer, not the UART. Anything
+that grades a boot must read `out/fb.txt` (see the CI fix below).
+
+## CI status (2026-10-22) and the fix
+
+Run `39776897329` (`qemu-boot`, job `qemu-userspace` = job id `119818017659`)
+**booted correctly but was reported as failed**: the verdict step read
+`out/serial.txt` (empty, see above) instead of the decoded framebuffer text,
+so `bsd_root_md0`/`pid1` were `false` although `out/fb.txt` contained
+`BSD root: md0` and `init running as PID 1` (17 heartbeats, no panic).
+
+Job `qemu-full-root` (job id `119818017825`) failed even earlier: `apfs-fuse`
+does not compile without `bzlib.h` (`libbz2-dev` was missing from the apt
+list), and its informational verdict then died with
+`FileNotFoundError: out/full-root-verdict.json` instead of writing the file.
+
+Commit `6495b3a` fixes both: the verdict now reads `out/fb.txt` first and
+falls back to `out/serial.txt` (matching a whitespace-flattened copy, because
+the framebuffer wraps console lines), reports which source it used, always
+writes its JSON, and the full-root job installs `libbz2-dev`, `zlib1g-dev`
+and `pkg-config`. The new verdict was checked against the artifacts of run
+`39776897329` and against the local Windows run: `pass: true` in both cases
+(`bsd_root_md0=true`, `pid1=true`, `heartbeats=17/23`, `panic=false`).
+
 ## Boot evidence from the development session (upstream @ 425b251)
 
 The QEMU flow this fork packages was driven end-to-end against real Apple

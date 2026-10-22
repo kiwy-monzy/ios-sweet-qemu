@@ -1,5 +1,72 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> UPDATE 2026-10-22 (QEMU fork - read first) <<<
+
+**STATE:** the QEMU fork of this repo lives in `github.com/20kiwy/ios-sweet-qemu`
+(public, MIT, fresh init, no upstream history; base `dipa-studio/ios-sweet @ 067c9b3`).
+Local clone of that fork: **`G:\ios-sweet-qemu`** (working copy used by this handoff).
+The phone-side notes below (2026-10-15..18) are unchanged.
+
+**Milestone: the SWEET kernel boots NATIVELY ON WINDOWS on the user's own PC.**
+Windows 11, i7-7700, 31.9 GiB RAM, QEMU 11.0.93 (`C:\Program Files\qemu`), LLVM 20.1.7
+(`C:\Program Files\LLVM\bin`), Python 3.13.15 (`C:\Python313\python.exe`).
+Work dir `E:\ios-sweet-work\winboot` (kernel `kernel.development.sweet` from xnu.yml
+run **39775943317**, artifact `xnu-kernel`, downloaded via the GitHub API).
+Commands that work on Windows (note: **no `llvm-mc`/`cpp` in this LLVM install** -
+use `clang` for both passes, and `arm64-apple-ios16.0.0` as the triple):
+
+```
+clang -x assembler-with-cpp -E -P tools\sweet-init.S -o sweet-init.s
+clang -target arm64-apple-ios16.0.0 -c sweet-init.s -o sweet-init.o
+python tools\mkinit.py sweet-init.o init
+python tools\mkadt.py payload.adt --qemu
+python tools\mkpayload.py kernel.development.sweet payload.adt payload.bin --ramdisk init --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 rd=md0"
+python tools\qemu-sweet.py payload.bin out --secs 150 --kernel kernel.development.sweet --live-serial
+```
+
+Result: payload layout identical to the CI build (`virt_base 0xfffffe0006000000`,
+`entry 0xfffffe000748b488`, `ramdisk 0xb24c8000`, `size 16621936`) and the boot
+reached `BSD root: md0` -> `load_init_program: ... /sbin/launchd` ->
+`*** SWEET userspace: init running as PID 1 ***`, 23 heartbeats over 150 s, no panic.
+Artifacts `E:\ios-sweet-work\winboot\out\{fb.png,fb.txt,regs.txt,qemu.log,result.json}`;
+copies of the screenshot in `C:\Users\PC\Downloads\shot-18-WINDOWS-native-boot-fb.png`.
+
+**KEY FACT (cost 2 CI runs to find):** the SWEET console is drawn into the
+framebuffer, so **`out/serial.txt` stays EMPTY**; the boot evidence is the decoded
+framebuffer text `out/fb.txt` (decoded with the kernel's `_iso_font`).
+
+**CI status:** `qemu-boot` run **39776897329** is RED but the boot itself was green -
+job `qemu-userspace` (id 119818017659) reached PID 1 with 17 heartbeats and no panic,
+the verdict step just grepped the empty `serial.txt`; job `qemu-full-root` (id
+119818017825) died in `apfs-fuse` (`fatal error: bzlib.h`, missing `libbz2-dev`) and
+its verdict crashed with `FileNotFoundError: out/full-root-verdict.json`.
+Both fixed in local commit **6495b3a** (`.github/workflows/qemu-boot.yml`): verdict
+reads `out/fb.txt` first (whitespace-flattened match), falls back to `serial.txt`,
+always writes its JSON; apt list += `libbz2-dev zlib1g-dev pkg-config`.
+The new verdict was checked against the artifacts of run 39776897329 and against the
+local Windows run -> `pass: true` in both.
+
+**BLOCKER (needs the user):** commit 6495b3a is **not pushed**. The fine-grained PAT
+that had write access to `20kiwy/ios-sweet-qemu` was revoked (API -> 401); the
+still-valid OAuth token of account `kiwy-monzy` has only `pull` on that repo
+(`git push` -> "Permission to 20kiwy/ios-sweet-qemu.git denied to kiwy-monzy").
+Unblock by (A) adding `kiwy-monzy` as a collaborator with write access on the repo,
+(B) a fresh PAT for the `20kiwy` account, or (C) mirroring to `kiwy-monzy/ios-sweet-qemu`
+and running the CI there. Until then the CI stays red and the §"Windows" proof comes
+from the local run above.
+
+**Local artifacts on this PC:** IPSW fully downloaded and CRC-complete at
+`E:\ios-sweet-work\iPhone10,3_16.7.16_20H392_Restore.ipsw` (6 171 035 648 bytes =
+Apple's official `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`; parts in
+`...\iPhone10,3_16.7.16_20H392_Restore.ipsw.parts\part000..015`).
+Building the real root from it needs Linux (apfs-fuse + hfsprogs + sudo/loop mounts):
+WSL has **no distribution installed** on this PC and the session is **not elevated**,
+so `tools/mkiosroot.sh` can only run in the CI `qemu-full-root` job for now.
+
+**NEXT ACTION:** get push access (A/B/C above) -> push 6495b3a -> dispatch
+`qemu-boot.yml` (kernel_run_id 39775943317) -> expect the userspace job green and
+the full-root job to get past apfs-fuse.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
